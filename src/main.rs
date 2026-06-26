@@ -16,10 +16,8 @@ async fn main() -> std::io::Result<()> {
 
     debug!("Starting FCM notification handler...");
 
-    // Initialize FCM Handler
     let fcm_handler = FCMHandlerV1::new();
 
-    // Example payload
     let payload = FCMPayloadData {
         title: "Hello!".to_string(),
         message: "This is a test notification.".to_string(),
@@ -27,12 +25,9 @@ async fn main() -> std::io::Result<()> {
         click_action: "OPEN_APP".to_string(),
     };
 
-    let token = "token from client";
-
-    // Send a push notification
-    match fcm_handler.push(payload, token.to_string()) {
+    match fcm_handler.push(&payload, "token from client").await {
         Ok(_) => debug!("Notification sent successfully!"),
-        Err(err) => debug!("Failed to send notification: {:?}", err),
+        Err(err) => debug!("Failed to send notification: {err}"),
     }
 
     Ok(())

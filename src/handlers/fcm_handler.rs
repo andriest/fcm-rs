@@ -6,13 +6,32 @@ use serde_json::{json, Value};
 use std::env;
 use std::time::Duration;
 
+#[derive(Debug, thiserror::Error)]
+pub enum FcmError {
+    #[error("Failed to read service key file: {0}")]
+    ServiceKeyRead(String),
+    #[error("Failed to parse service key JSON: {0}")]
+    ServiceKeyParse(String),
+    #[error("Missing project_id in service key")]
+    MissingProjectId,
+    #[error("Failed to obtain access token: {0}")]
+    AccessToken(String),
+    #[error("HTTP request failed: {0}")]
+    HttpRequest(String),
+}
+
 pub struct FCMHandlerV1 {
     key_path: String,
     client: HttpClient,
 }
 
+impl Default for FCMHandlerV1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FCMHandlerV1 {
-    /// Add push notification handler.
     pub fn new() -> FCMHandlerV1 {
         let client = HttpClient::builder()
             .tcp_keepalive(Duration::from_secs(15))
@@ -27,71 +46,46 @@ impl FCMHandlerV1 {
         }
     }
 
-    fn read_service_key_file(&self) -> Result<String, String> {
-        let private_key_content = match std::fs::read(&self.key_path) {
-            Ok(content) => content,
-            Err(err) => return Err(err.to_string()),
-        };
-
-        Ok(String::from_utf8(private_key_content).unwrap())
+    fn read_service_key_file(&self) -> Result<String, FcmError> {
+        let content = std::fs::read(&self.key_path)
+            .map_err(|e| FcmError::ServiceKeyRead(e.to_string()))?;
+        String::from_utf8(content).map_err(|e| FcmError::ServiceKeyRead(e.to_string()))
     }
 
-    fn read_service_key_file_json(&self) -> Result<Value, String> {
-        let file_content = match self.read_service_key_file() {
-            Ok(content) => content,
-            Err(err) => return Err(err.to_string()),
-        };
-
-        let json_content: Value = match serde_json::from_str(&file_content) {
-            Ok(json) => json,
-            Err(err) => return Err(err.to_string()),
-        };
-
-        Ok(json_content)
+    fn read_service_key_file_json(&self) -> Result<Value, FcmError> {
+        let content = self.read_service_key_file()?;
+        serde_json::from_str(&content).map_err(|e| FcmError::ServiceKeyParse(e.to_string()))
     }
 
-    fn get_project_id(&self) -> Result<String, String> {
-        let json_content = match self.read_service_key_file_json() {
-            Ok(json) => json,
-            Err(err) => return Err(err),
-        };
-
-        let project_id = match json_content["project_id"].as_str() {
-            Some(project_id) => project_id,
-            None => return Err("could not get project_id".to_string()),
-        };
-
-        Ok(project_id.to_string())
+    fn get_project_id(&self) -> Result<String, FcmError> {
+        let json = self.read_service_key_file_json()?;
+        json["project_id"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or(FcmError::MissingProjectId)
     }
 
-    pub async fn access_token(&self) -> Result<String, String> {
+    pub async fn access_token(&self) -> Result<String, FcmError> {
         let scopes = vec!["https://www.googleapis.com/auth/firebase.messaging"];
         let mut service_account = ServiceAccount::from_file(&self.key_path, scopes);
-        let access_token = match service_account.access_token().await {
-            Ok(access_token) => access_token,
-            Err(err) => return Err(err.to_string()),
-        };
+        let token = service_account
+            .access_token()
+            .await
+            .map_err(|e| FcmError::AccessToken(e.to_string()))?;
 
-        let token_no_bearer = access_token.split(" ").collect::<Vec<&str>>()[1];
-
-        Ok(token_no_bearer.to_string())
+        // The token is returned as "Bearer <token>"; extract only the token part.
+        token
+            .split_once(' ')
+            .map(|(_, t)| t.to_string())
+            .ok_or_else(|| FcmError::AccessToken("unexpected token format".to_string()))
     }
 
-    async fn get_auth_token(&self) -> Result<String, String> {
-        let tkn = match self.access_token().await {
-            Ok(tkn) => tkn,
-            Err(_) => return Err("could not get access token".to_string()),
-        };
+    pub async fn push(&self, payload: &FCMPayloadData, token: &str) -> Result<(), FcmError> {
+        debug!("Sending to token: {}", token);
 
-        Ok(tkn)
-    }
-
-    pub fn push<'a>(&self, payload: FCMPayloadData, token: String) -> Result<(), ()> {
-        debug!("Sending to token: {}", &token);
-
-        let message: Value = json!({
+        let message = json!({
             "message": {
-                "token": &token,
+                "token": token,
                 "notification": {
                     "title": &payload.title,
                     "body": &payload.message,
@@ -109,21 +103,12 @@ impl FCMHandlerV1 {
             }
         });
 
-        let _ = self.send_notification_to(&message.to_string());
-
-        Ok(())
+        self.send_notification_to(&message.to_string()).await
     }
 
-    pub async fn send_notification_to(&self, message: &str) -> Result<(), String> {
-        let project_id = match self.get_project_id() {
-            Ok(project_id) => project_id,
-            Err(err) => return Err(err),
-        };
-
-        let auth_token = match self.get_auth_token().await {
-            Ok(tkn) => tkn,
-            Err(err) => return Err(err),
-        };
+    pub async fn send_notification_to(&self, message: &str) -> Result<(), FcmError> {
+        let project_id = self.get_project_id()?;
+        let auth_token = self.access_token().await?;
 
         // https://firebase.google.com/docs/reference/fcm/rest/v1/projects.messages/send
         let url = format!(
@@ -135,10 +120,7 @@ impl FCMHandlerV1 {
 
         let request = Request::post(&url)
             .header("Content-Type", "application/json")
-            .header(
-                "content-length",
-                format!("{}", payload.len() as u64).as_str(),
-            )
+            .header("content-length", payload.len().to_string().as_str())
             .timeout(Duration::from_secs(60))
             .header("Authorization", format!("Bearer {}", auth_token).as_str())
             .body(payload)
@@ -146,16 +128,14 @@ impl FCMHandlerV1 {
 
         match self.client.send(request) {
             Ok(mut resp) => {
-                let resp_text = resp.text().unwrap_or("".to_string());
+                let body = resp.text().unwrap_or_default();
                 if resp.status().is_success() {
-                    debug!("FCM Sent: {}", resp_text);
+                    debug!("FCM Sent: {}", body);
                 } else {
-                    error!("FCM Error {}: {}", resp.status(), resp_text);
+                    error!("FCM Error {}: {}", resp.status(), body);
                 }
             }
-            Err(err) => {
-                error!("FCM request error: {:?}", err);
-            }
+            Err(err) => return Err(FcmError::HttpRequest(err.to_string())),
         }
 
         Ok(())
